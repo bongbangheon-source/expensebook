@@ -1,0 +1,17 @@
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+process.env.APP_PASSWORD = 'test-only-long-password';
+delete process.env.DATABASE_URL;
+const app = require('../app');
+delete process.env.DATABASE_URL;
+let server, base, cookie;
+before(async () => { server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve)); base = `http://127.0.0.1:${server.address().port}`; });
+after(() => new Promise(resolve => server.close(resolve)));
+test('private API requires authentication', async () => { const r = await fetch(base+'/api/expenses?month=2026-10'); assert.equal(r.status,401); });
+test('login rejects invalid password', async () => { const r = await fetch(base+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:'wrong'})}); assert.equal(r.status,401); });
+test('login issues protected cookie and authenticates session', async () => { const r = await fetch(base+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:process.env.APP_PASSWORD})}); assert.equal(r.status,200); const header = r.headers.get('set-cookie'); assert.match(header,/HttpOnly/); assert.match(header,/SameSite=Strict/); cookie=header.split(';')[0]; assert.equal((await fetch(base+'/api/session',{headers:{cookie}})).status,200); });
+test('tampered cookie is rejected', async () => { assert.equal((await fetch(base+'/api/session',{headers:{cookie:cookie+'0'}})).status,401); });
+test('invalid dates and amounts are rejected before database access', async () => { for(const body of [{date:'2026-02-30',title:'점심',category:'식비',amount:1000},{date:'2026-10-15',title:'점심',category:'식비',amount:-1},{date:'2026-10-15',title:' ',category:'식비',amount:1000}]) { const r=await fetch(base+'/api/expenses',{method:'POST',headers:{cookie,'Content-Type':'application/json'},body:JSON.stringify(body)});assert.equal(r.status,400); } });
+test('database configuration errors do not expose secrets', async () => { const r=await fetch(base+'/api/expenses?month=2026-10',{headers:{cookie}});assert.equal(r.status,503); const body=await r.text();assert.ok(!body.includes(process.env.APP_PASSWORD));assert.match(body,/DATABASE_URL/); });
+test('cross-site mutations are rejected', async () => { const r=await fetch(base+'/api/logout',{method:'POST',headers:{cookie,'sec-fetch-site':'cross-site'}});assert.equal(r.status,403); });
+test('static application is served with security headers', async () => { const r=await fetch(base);assert.equal(r.status,200);assert.ok(r.headers.get('content-security-policy'));assert.match(await r.text(),/차곡/); });
