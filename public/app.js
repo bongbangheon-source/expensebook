@@ -1,8 +1,9 @@
 const $ = id => document.getElementById(id);
 const categories = ['식비','카페·간식','교통','쇼핑','주거·통신','건강','문화·여가','기타'];
+const incomeCategories = ['급여','용돈','부수입','사업소득','이자·배당','기타'];
 const won = n => new Intl.NumberFormat('ko-KR').format(n) + '원';
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
-let editing = null, records = [], requestId = 0;
+let editing = null, records = [], requestId = 0, activeType = 'expenses', editorType = 'expenses';
 $('month').value = today().slice(0,7);
 categories.forEach(c => $('category').add(new Option(c,c)));
 async function api(url, options = {}) {
@@ -19,19 +20,24 @@ async function load() {
   try {
     const query = new URLSearchParams({ month:$('month').value });
     if($('date-filter').value) query.set('date',$('date-filter').value);
-    const data = await api('/expenses?' + query);
+    const type = activeType;
+    const [data, incomeData, summary] = await Promise.all([api('/expenses?' + query), api('/incomes?' + query), api('/summary?' + new URLSearchParams({ month:$('month').value }))]);
     if(id !== requestId) return;
-    records = data.expenses;
-    $('total').textContent = won(data.total); $('count').textContent = data.count + '건';
+    records = type === 'incomes' ? incomeData.incomes : data.expenses;
+    $('total').textContent = won(summary.expense); $('income-total').textContent = won(summary.income);
+    $('balance').textContent = won(summary.balance); $('monthly-balance').textContent = won(summary.monthlyBalance);
+    $('monthly-balance').classList.toggle('negative', summary.monthlyBalance < 0);
+    $('count').textContent = data.count + '건';
     const sorted = [...data.categories].sort((a,b) => b.amount-a.amount), top = sorted[0];
     $('top').textContent = top.amount ? top.category : '—'; $('top-amount').textContent = top.amount ? won(top.amount) + ' 사용했어요' : '아직 기록이 없어요';
     $('rows').replaceChildren(); $('empty').hidden = records.length > 0;
+    $('empty').textContent = `조회한 ${type === 'incomes' ? '소득' : '지출'} 내역이 없어요. 새로운 내역을 기록해 보세요.`;
     for(const row of records) {
       const tr=node('tr'), title=node('td'); title.append(node('span',row.date,'date'),node('span',row.title));
       const category=node('td'); category.append(node('span',row.category,'tag'));
       const actions=node('td',undefined,'actions');
-      const edit=node('button','수정'); edit.setAttribute('aria-label',row.title+' 수정'); edit.onclick=()=>openEditor(row);
-      const del=node('button','삭제'); del.setAttribute('aria-label',row.title+' 삭제'); del.onclick=async()=>{ if(!confirm(`'${row.title}' 내역을 삭제할까요?`)) return; del.disabled=true; try{await api('/expenses/'+row.id,{method:'DELETE'});toast('내역을 삭제했어요.');await load();}catch(e){toast(e.message);del.disabled=false;} };
+      const edit=node('button','수정'); edit.setAttribute('aria-label',row.title+' 수정'); edit.onclick=()=>openEditor(row,type);
+      const del=node('button','삭제'); del.setAttribute('aria-label',row.title+' 삭제'); del.onclick=async()=>{ if(!confirm(`'${row.title}' 내역을 삭제할까요?`)) return; del.disabled=true; try{await api('/'+type+'/'+row.id,{method:'DELETE'});toast('내역을 삭제했어요.');await load();}catch(e){toast(e.message);del.disabled=false;} };
       actions.append(edit,del); tr.append(title,category,node('td',won(row.amount),'right'),actions); $('rows').append(tr);
     }
     $('chart').replaceChildren();
@@ -39,13 +45,26 @@ async function load() {
       const item=node('div',undefined,'bar-item'),label=node('div',undefined,'bar-label');label.append(node('span',entry.category),node('span',won(entry.amount)));
       const track=node('div',undefined,'track'),fill=node('div',undefined,'fill'); fill.style.width=(top.amount ? entry.amount/top.amount*100 : 0)+'%';track.append(fill);item.append(label,track);$('chart').append(item);
     }
-  } catch(e) { if(id === requestId){$('rows').replaceChildren();records=[];$('chart').replaceChildren();$('total').textContent='—';$('count').textContent='—';$('top').textContent='—';$('top-amount').textContent='';$('empty').hidden=false;$('empty').textContent=e.message;toast(e.message);} }
+  } catch(e) { if(id === requestId){$('rows').replaceChildren();records=[];$('chart').replaceChildren();for(const field of ['total','income-total','balance','monthly-balance','count','top']) $(field).textContent='—';$('top-amount').textContent='';$('empty').hidden=false;$('empty').textContent=e.message;toast(e.message);} }
 }
-function openEditor(row) { editing=row?.id ?? null; $('expense-form').reset();$('editor-title').textContent=editing?'지출 수정하기':'지출 기록하기';$('expense-date').value=row?.date || today();$('title').value=row?.title || '';$('category').value=row?.category || categories[0];$('amount').value=row?.amount || '';$('form-error').textContent='';$('editor').showModal(); }
+function openEditor(row, type = 'expenses') {
+  editorType = type; editing = row?.id ?? null;
+  const label = type === 'incomes' ? '소득' : '지출', options = type === 'incomes' ? incomeCategories : categories;
+  $('expense-form').reset(); $('category').replaceChildren(); options.forEach(c => $('category').add(new Option(c,c)));
+  $('editor-title').textContent=label+(editing?' 수정하기':' 기록하기');$('expense-date').value=row?.date || today();$('title').value=row?.title || '';
+  $('title').placeholder=type === 'incomes'?'어떤 소득이 들어왔나요?':'어디에 사용하셨나요?';
+  $('category').value=row?.category || options[0];$('amount').value=row?.amount || '';$('form-error').textContent='';$('editor').showModal();
+}
+function selectType(type) {
+  activeType=type; $('expense-tab').setAttribute('aria-pressed',String(type === 'expenses'));$('income-tab').setAttribute('aria-pressed',String(type === 'incomes'));
+  $('list-description').textContent=type === 'incomes'?'들어온 소득을 날짜별로 확인해 보세요.':'어디에 얼마나 썼는지 확인해 보세요.';
+}
+$('expense-tab').onclick=()=>{selectType('expenses');load();};$('income-tab').onclick=()=>{selectType('incomes');load();};
 $('login-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;$('login-error').textContent='';try{await api('/login',{method:'POST',body:JSON.stringify({password:$('password').value})});$('password').value='';$('login-view').hidden=true;$('dashboard').hidden=false;await load();}catch(err){$('login-error').textContent=err.message;}finally{button.disabled=false;}};
 $('logout').onclick=async()=>{try{await api('/logout',{method:'POST'});++requestId;records=[];showLogin();}catch(e){toast(e.message);}};
 $('add').onclick=()=>openEditor();$('close').onclick=()=>$('editor').close();
-$('expense-form').onsubmit=async e=>{e.preventDefault();$('save').disabled=true;$('form-error').textContent='';try{const body={date:$('expense-date').value,title:$('title').value.trim(),category:$('category').value,amount:Number($('amount').value)};await api('/expenses'+(editing?'/'+editing:''),{method:editing?'PUT':'POST',body:JSON.stringify(body)});$('month').value=body.date.slice(0,7);$('date-filter').value='';$('editor').close();toast('지출을 저장했어요.');await load();}catch(err){$('form-error').textContent=err.message;}finally{$('save').disabled=false;}};
+$('add-income').onclick=()=>openEditor(undefined,'incomes');
+$('expense-form').onsubmit=async e=>{e.preventDefault();$('save').disabled=true;$('form-error').textContent='';try{const body={date:$('expense-date').value,title:$('title').value.trim(),category:$('category').value,amount:Number($('amount').value)};await api('/'+editorType+(editing?'/'+editing:''),{method:editing?'PUT':'POST',body:JSON.stringify(body)});$('month').value=body.date.slice(0,7);$('date-filter').value='';selectType(editorType);$('editor').close();toast((editorType==='incomes'?'소득':'지출')+'을 저장했어요.');await load();}catch(err){$('form-error').textContent=err.message;}finally{$('save').disabled=false;}};
 $('month').onchange=()=>{if(!$('month').value)return;$('date-filter').value='';load();};
 $('date-filter').onchange=()=>{if($('date-filter').value)$('month').value=$('date-filter').value.slice(0,7);load();};
 $('clear').onclick=()=>{$('date-filter').value='';load();};

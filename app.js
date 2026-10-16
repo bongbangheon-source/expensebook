@@ -36,13 +36,60 @@ let sql, ready;
 async function database() {
   if (!process.env.DATABASE_URL) { const error = new Error('DB_CONFIG'); throw error; }
   sql ||= neon(process.env.DATABASE_URL);
-  ready ||= sql`CREATE TABLE IF NOT EXISTS expenses (id SERIAL PRIMARY KEY, date DATE NOT NULL, title VARCHAR(100) NOT NULL, category VARCHAR(30) NOT NULL, amount BIGINT NOT NULL CHECK (amount > 0 AND amount <= 999999999999), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`.catch(error => { ready = null; throw error; });
+  ready ||= (async () => {
+    await sql`CREATE TABLE IF NOT EXISTS expenses (id SERIAL PRIMARY KEY, date DATE NOT NULL, title VARCHAR(100) NOT NULL, category VARCHAR(30) NOT NULL, amount BIGINT NOT NULL CHECK (amount > 0 AND amount <= 999999999999), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+    await sql`CREATE TABLE IF NOT EXISTS incomes (id SERIAL PRIMARY KEY, date DATE NOT NULL, title VARCHAR(100) NOT NULL, category VARCHAR(30) NOT NULL, amount BIGINT NOT NULL CHECK (amount > 0 AND amount <= 999999999999), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+  })().catch(error => { ready = null; throw error; });
   await ready;
   return sql;
 }
 const categories = ['식비', '카페·간식', '교통', '쇼핑', '주거·통신', '건강', '문화·여가', '기타'];
+const incomeCategories = ['급여', '용돈', '부수입', '사업소득', '이자·배당', '기타'];
 function validDate(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number(value.slice(0,4)) >= 1900 && Number(value.slice(0,4)) <= 9999 && !isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value; }
-function validExpense(body) { return validDate(body.date) && typeof body.title === 'string' && body.title.trim().length > 0 && body.title.trim().length <= 100 && categories.includes(body.category) && Number.isSafeInteger(body.amount) && body.amount > 0 && body.amount <= 999999999999; }
+function validExpense(body, allowedCategories = categories) { return body && validDate(body.date) && typeof body.title === 'string' && body.title.trim().length > 0 && body.title.trim().length <= 100 && allowedCategories.includes(body.category) && Number.isSafeInteger(body.amount) && body.amount > 0 && body.amount <= 999999999999; }
+function validMonth(month) { return typeof month === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(month) && validDate(`${month}-01`); }
+app.get('/api/summary', async (req, res) => {
+  const { month } = req.query;
+  if (!validMonth(month)) return res.status(400).json({ error: '조회 월을 확인해 주세요.' });
+  const db = await database();
+  const [summary] = await db`
+    WITH income_totals AS (
+      SELECT COALESCE(SUM(amount), 0) AS total,
+        COALESCE(SUM(amount) FILTER (WHERE date >= ${month + '-01'}::date AND date < (${month + '-01'}::date + interval '1 month')), 0) AS monthly FROM incomes
+    ), expense_totals AS (
+      SELECT COALESCE(SUM(amount), 0) AS total,
+        COALESCE(SUM(amount) FILTER (WHERE date >= ${month + '-01'}::date AND date < (${month + '-01'}::date + interval '1 month')), 0) AS monthly FROM expenses
+    )
+    SELECT income_totals.monthly::float8 AS income, expense_totals.monthly::float8 AS expense,
+      (income_totals.monthly - expense_totals.monthly)::float8 AS "monthlyBalance",
+      (income_totals.total - expense_totals.total)::float8 AS balance FROM income_totals, expense_totals`;
+  res.json(summary);
+});
+app.get('/api/incomes', async (req, res) => {
+  const { month, date } = req.query;
+  if (!validMonth(month) || (date && (!validDate(date) || !date.startsWith(month)))) return res.status(400).json({ error: '조회 날짜를 확인해 주세요.' });
+  const db = await database();
+  const rows = await db`SELECT id, to_char(date, 'YYYY-MM-DD') AS date, title, category, amount::float8 AS amount FROM incomes WHERE date >= ${month + '-01'}::date AND date < (${month + '-01'}::date + interval '1 month') ORDER BY date DESC, id DESC`;
+  res.json({ incomes: date ? rows.filter(row => row.date === date) : rows, total: rows.reduce((sum, row) => sum + row.amount, 0), count: rows.length });
+});
+app.post('/api/incomes', async (req, res) => {
+  if (!validExpense(req.body, incomeCategories)) return res.status(400).json({ error: '날짜, 항목, 카테고리와 금액을 확인해 주세요.' });
+  const { date, title, category, amount } = req.body, db = await database();
+  const [row] = await db`INSERT INTO incomes (date, title, category, amount) VALUES (${date}, ${title.trim()}, ${category}, ${amount}) RETURNING id`;
+  res.status(201).json(row);
+});
+app.put('/api/incomes/:id', async (req, res) => {
+  if (!/^\d{1,10}$/.test(req.params.id) || Number(req.params.id) > 2147483647 || !validExpense(req.body, incomeCategories)) return res.status(400).json({ error: '입력값을 확인해 주세요.' });
+  const { date, title, category, amount } = req.body, db = await database();
+  const rows = await db`UPDATE incomes SET date=${date}, title=${title.trim()}, category=${category}, amount=${amount} WHERE id=${req.params.id} RETURNING id`;
+  res.status(rows.length ? 200 : 404).json(rows.length ? { ok: true } : { error: '내역을 찾을 수 없습니다.' });
+});
+app.delete('/api/incomes/:id', async (req, res) => {
+  if (!/^\d{1,10}$/.test(req.params.id) || Number(req.params.id) > 2147483647) return res.status(400).json({ error: '잘못된 ID입니다.' });
+  const db = await database();
+  const rows = await db`DELETE FROM incomes WHERE id=${req.params.id} RETURNING id`;
+  res.status(rows.length ? 200 : 404).json(rows.length ? { ok: true } : { error: '내역을 찾을 수 없습니다.' });
+});
 app.get('/api/expenses', async (req, res) => {
   const month = req.query.month, date = req.query.date;
   if (typeof month !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(month) || !validDate(`${month}-01`) || (date && (!validDate(date) || !date.startsWith(month)))) return res.status(400).json({ error: '조회 날짜를 확인해 주세요.' });
